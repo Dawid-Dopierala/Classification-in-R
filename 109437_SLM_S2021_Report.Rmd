@@ -1,0 +1,1001 @@
+---
+title: "R Notebook"
+output:
+  html_document:
+    df_print: paged
+  html_notebook: default
+  pdf_document: default
+editor_options:
+  chunk_output_type: inline
+---
+```{r}
+Sys.setenv(LANG = "en")
+require(mltools)
+require(data.table)
+require(rpart)
+require(party)
+require(corrplot)
+require(caret)
+require(ipred)
+require(class)
+require(ggbiplot)
+require(randomForest)
+require(ROCR)
+require(pROC)
+library(Rtsne)
+library(ggplot2)
+require(factoextra)
+require(caret)
+```
+
+1) Our task is to make a model that predicts is it worth to call a client (if called client will subscribe for a term deposit) based on the https://archive.ics.uci.edu/ml/datasets/Bank+Marketing dataset. The campaigns related to this dataset were conducted in 2008-2010 by a Portugese bank. Our target variable is "y", which stays for "has the client subscribed a term deposit?" so we are looking for peoples who got some spare money and want to safely invest it. We got plenty of variables: "personal" (like the age, martial status etc.), related to the last contact (like is this a telephone or cellphone number), macroeconomics (e.g. employment variation rate) and some other, like the outcome of the previous camping for this client. Loading the file (sadly I think that there is no way to load it directly from the zip file on the website):
+```{r}
+data <- read.csv(file = "C:\\Users\\von dawdop\\Desktop\\machine_learning\\bank-additional\\bank-additional-full.csv", sep = ';', na.strings="unknown")
+```
+```{r}
+#of course we have to delete duplicate rows before doing anything else
+data <- unique( data )
+data
+```
+As we can see the dataset is pretty big, we go around 42000 rows and 20 explanatory variables and:
+```{r}
+table(data$y)
+```
+so this dataset is unbalanced (we have to account of it during data preprocessing and building/measuring models). So, our task is first (after some datapreprocessing) delete some variables (dimensionality reduction, we will have a lot of dummys), then  to cluster some of the dummy variables (for the further dimensionality reduction) and then make a classification of y using some machine learning models (mainly logistic regression, K nearest neighbors and random forest). 
+
+The duration variables tells how much time the last call took, so if duration=0 y will always be "no". This makes variable rather useless, since we don't know how much time the call will take (it also higly affects the outcome):
+```{r}
+data$duration <- NULL
+```
+
+
+The features explanation will be done at 2), together with cleaning the dataset.
+2) First of all, lets code some usefull functions (all of them are based on the code presented at the classes):
+```{r}
+#This function plots the ratio of fail/succes (y.values will be always y column from our dataset) and makes a spline for x.values numeric variable
+ratio_plot = function (x.values, y.values, x.name, dataset) {
+    N=nrow(dataset)
+    data <- as.data.frame.matrix(table(x.values, y.values))
+    data$ratio <- data[,1]/data[,2]
+    #removing infinite and nan values
+    data <- data[is.finite(rowSums(data)),]
+    data$percent_of_the_data= (data[,1]+data[,2])*100/N
+    # we will use some different collors: if particular variable is less than 0.5% of the dataset the dot on plot is red, if <5% its blue, the rest is gray 
+    plot(rownames(data), data$ratio,
+         xlab = x.name, ylab = "fail/succes ratio", main = NULL, col = ifelse(data$percent_of_the_data<0.5, 'red', ifelse(data$percent_of_the_data<1, 'blue', 'gray')))
+    lines(smooth.spline(rownames(data), data$ratio), lwd = 2)
+}
+#This function plots the fail/succes ratio and makes a spline for x.values numeric variable
+#This function makes a table with the ratio of fail/succes for all levels of value form x.values and presents them in decreasing (as % of the dataset) manner.
+ratio_table_old= function (x.values, y.values, dataset) {
+    N=nrow(dataset)
+    data <- as.data.frame.matrix(table(x.values, y.values, useNA="always"))
+    data$ratio <- data[,1]/data[,2]
+    data$percent_of_the_data= (data[,1]+data[,2])*100/N
+    data <- data[order(data$percent_of_the_data, decreasing = TRUE),]  
+    #data[,3] <-NULL
+    data
+}
+#the previous one will get "X" in front of non-nan values name so we will have another version of it.
+ratio_table= function (x.values, y.values, dataset) {
+    N=nrow(dataset)
+    data <- as.data.frame.matrix(table(x.values, y.values))
+    data$ratio <- data[,1]/data[,2]
+    data$percent_of_the_data= (data[,1]+data[,2])*100/N
+    data <- data[order(data$percent_of_the_data, decreasing = TRUE),]  
+    #data[,3] <-NULL
+    data
+}
+#Boxplot for a numeric variable
+DoBoxplot = function(values, values.name) {
+  boxplot(values, horizontal = TRUE, xlab = values.name)
+  median.leg = paste("median = ", round(median(values), digits = 4))
+  q25 = quantile(values, 0.25)
+  q25.leg = paste("25th percentile =", round(q25,digits = 4),"\n")
+  q75 = quantile(values, 0.75)
+  q75.leg = paste("75th percentile =", round(q75,digits = 4))
+  legend(x = "top", median.leg, bty = "n")
+  legend(x = "bottom", paste(q25.leg, q75.leg, sep = ""), bty = "n")
+}
+#this one simply runs all 3 above
+run3 = function(x.values, y.values, dataset, values.name) {
+  ratio_plot(x.values, y.values, values.name, dataset)
+  DoBoxplot(x.values, values.name)
+  ratio_table(x.values, y.values, dataset)
+}
+```
+Now we should look where the missing data is:
+```{r}
+colSums(is.na(data))
+table(data$y)
+ratio_table_old(data$job, data$y, data)
+```
+The ratio of no to yes in y in the whole dataset is around 7.87 and we should keep that in mind when removing observation (we dont want to remove too much of the yes because we will be forced to balance the data later on). We can now remove the rows with nans in marital (these are only 80 observation) and for the job (less than 1% of the dataset, the ratio is preety close to the one in the whole). For the job variable it may mean that those missing values are random ones (e.g. human error when imputing data into computer). So we can just remove it. As said in the data description on the website we should also remove the duration variable:
+```{r}
+data <- data[!is.na(data$marital),]
+data <- data[!is.na(data$job),]
+table(data$loan, data$housing, useNA="always")
+ratio_table_old(data$loan,data$y,data)
+ratio_table_old(data$housing, data$y, data)
+data$housing<-ifelse(data$housing=="yes",1,0)
+data$loan<-ifelse(data$loan=="yes",1,0)
+```
+The housing and loan variables stays for if the person have housing or personal loan. As we can see those variables all have the nans in the same rows, so those lacks of information may be caused by the fact that the company employer didn't menaged to gather information about it or by the human error. I also think that both variables are important, because haveing housing or personal loan means that you already needed some money and thus may have much less spare cash, the housing loan means that you propably have to pay a lot of cash each month and you may not have money to spare. So we will remove rows with nans are leave those variables (even throught the correlation with loan is so low):
+```{r}
+data <- data[!is.na(data$loan),]
+ratio_table_old(data$default, data$y, data)
+ratio_table_old(data$education, data$y, data)
+```
+The defeault means if someone has a credit in default. This variable should be extreamly important, because if someone has a credit to payoff he will be way less likely to subscribe for a term deposit. As we can see there are only 3 "yes" and plenty of nans, so I belive that people haveing a credit in default may be hiding it. For this reason we will remove those 3 yes rows and make a new variable, if the defoult is known. 
+For the education I believe it's very important, since better education is correlated to higher payment, so more more cash to put into a term deposit. For the unknown education its about 4% of the dataset and the nans seems not to be just random noise and it also has very low ratio of no to yes, so we should try to fill those nans (we will also remove the illiterates because there are only 18 of them):
+```{r}
+data <- data[!grepl("illiterate", data$education),]
+data <- data[!grepl("yes", data$default),]
+data$default_unknown<-ifelse(is.na(data$default),1,0)
+data$default <- NULL
+#For the contact column they are only 2 columns, so we can make it binary
+data$contact_by_tel<-ifelse(data$contact=="telephone",1,0)
+data$contact <- NULL
+data$y<-ifelse(data$y=="yes",1,0)
+```
+
+```{r}
+#im factoring all the char columns except for education so I can one hot encode them with one command
+data_for_estimation <-data
+data_for_estimation$month <- as.factor(data_for_estimation$month)
+data_for_estimation$job <- as.factor(data_for_estimation$job)
+data_for_estimation$marital <- as.factor(data_for_estimation$marital)
+data_for_estimation$poutcome <- as.factor(data_for_estimation$poutcome)
+data_for_estimation$day_of_week <- as.factor(data_for_estimation$day_of_week)
+data_for_estimation <- one_hot(as.data.table(data_for_estimation))
+data_for_estimation$education <- as.factor(data_for_estimation$education)
+
+
+educ_good <- data_for_estimation[!is.na(data$education), ]
+educ_nan <- data_for_estimation[is.na(data$education), ]
+
+
+spec = c(train = 0.6, test = 0.2, validate = 0.2)
+set.seed(100)
+g = sample(cut(seq(nrow(educ_good)), nrow(educ_good)*cumsum(c(0,spec)),labels = names(spec)))
+  
+data_g = split(educ_good, g)
+data_new_g = split(educ_good, g)
+
+educ_trainingset<- data_new_g[[1]]
+educ_test <- data_new_g[[2]]
+educ_validation <- data_new_g[[3]]
+
+#for the decision tree Im using code from the lab
+set.seed(100)
+rpart_initial = rpart(education~.-y, data=educ_trainingset,cp=0 , method='class')
+#Now we have to get the optimal cp (parameter related to when the tree stops spliting)
+cp_optimal = rpart_initial$cptable[which(rpart_initial$cptable[,"xerror"]==min(rpart_initial$cptable[,"xerror"])),"CP"]
+rpart_optimal = prune(rpart_initial, cp_optimal)
+educ_rpart_prediction = predict(rpart_optimal, newdata=educ_validation, type = 'class')
+mt_rpart = table(educ_rpart_prediction, educ_validation$education)
+diagonal_sum = 0
+for (i in colnames(mt_rpart)){
+  diagonal_sum = diagonal_sum + mt_rpart[as.character(i),as.character(i)]
+}
+#Accuracy
+diagonal_sum/sum(mt_rpart)
+mt_rpart
+```
+As we can see the accuracy is very bad, so we should just remove remove it:
+
+```{r}
+data <- data[!is.na(data$education),]
+```
+We are done with the missing values so we can head into cleaning the data:
+
+```{r}
+ratio_table(data$marital,data$y,data)
+ratio_table(data$month,data$y,data)
+ratio_table(data$day_of_week,data$y,data)
+ratio_table(data$contact_by_tel,data$y,data)
+```
+The martial variable stays person martial status. As we can see, singles tend do use subscribe to the term deposit more often, it may be related to the fact that they are younger and may want to accumulate more wealth.
+For the month variable (when the call was made) it should not be too important (I don't think that using term deposit is seasonal), but in our case it is. It may be the reason of the fact that the campaigns were conducted from 2008 to 2010 so it may vary because of the economic crisis in 2008 and recovering from it. As we can see october, september, march and december variables all contribute to a small part of the data and have very similar ratio, so we can just merge them. 
+The day variable may be in fact important, because it may be the case that in the Portugal peoples usually get paid at the fridays so they are more likely to get a deposit. For the reason that we got data from 3 years it cannot be an accident that in the thuesday peoples are more likely to get it monday. I think that we should also merge the tuesday and wednesday because they got almost the same ratio.
+Contact_by_tel variable stays if the contact was performed by the telephone (1) or by the cellphone (0). I think that the reason why this variable is so important is that in 2008 a cellphone was still pretty rare, so it could be some of expensive item.
+```{r}
+data$month <- ifelse(data$month %in% c("dec", "mar", "sep", "oct"), "3_7_9_12", data$month)
+data$day_of_week <- ifelse(data$day_of_week %in% c("tue", "wed"), "tue_wed", data$day_of_week)
+data <- unique(data)
+```
+Now we can head to the numerical variables:
+```{r}
+run3(data$campaign, data$y,data, "campaign")
+nrow(data[data$campaign <11,])
+nrow(data)
+```
+Campaign is the number of contacts performed for the client during this campaign. As we should have expected, the ratio greatly increases with the number of calls and that's obvious: you will get annoyed if you are getting called few times a month and if you have not accepted the offer yet you are unlikely to accept it during another call. Also keep in mind that this one also includes the last call, so the one we are asking if its worth calling.
+
+As we can see there are plenty of values to be merge, so here comes the VERY important question: do we want to just model the dataset as good as possible or do we want to get a model that will predicts the outcome in the future? In the first case merging variables values may be a very bad idea, because for example it will lower the performance of a random forest (but also decrease computation time slightly). In the latter case we should remove the red dots and merge the blue ones, because the red one as surely outliners (I dont think that calling someone FOURTY TIMES must be an accident, calling so many times is just pointless) while the blue ones are just extreme cases of calling someone too many times. The another advantage of this approach is that we will balance the dataset a little bit.
+
+So I will assume that we want to model the future, so we gonna merge the blue dots and remove the red ones (also then the relation will be nicely linear, t will be very hopeful for the logistic regression):
+
+```{r}
+data <- data[data$campaign <11,]
+data$campaign <- ifelse(data$campaign > 7, 9, data$campaign)
+```
+
+```{r}
+run3(data$pdays, data$y,data, "pdays")
+```
+Pdays is the number of days that passed from the last call during previous campaign, 999 means that he was not contacted. This one should also be important for the same reasons as for the campaign: if client was contacted and does not get the term deposit it is unlikely that he will do so now. Should of course make it binary (also note that it is different from the previous one, because this is about the previous campaign).
+```{r}
+data$last_campaign_contacted <- ifelse(data$pdays==999 ,0,1)
+data$pdays <- NULL
+```
+```{r}
+df <- data
+```
+```{r}
+run3(data$previous, data$y,data, "previous")
+ratio_plot(exp(-data$previous),data$y, "exp(-previous)", data)
+```
+This variables stays for the number of contacts performed before this campaign and for this client (so I think it should account for the ALL previous campaigns). The numbers here are way lower than in the "campaign" and this means that the gross majority of the calls was made during the last year. In this case the ratio decreases with the number of calls, it may be because the calls were mostly made if there was an succes during the last campaign (and this does require at least one previous call, 2 calls means 2 successes in 2 different campaigns etc). We will also merge values higher than 2 and take the exp(-x) transformation to get it linear:
+```{r}
+data$previous <- ifelse(data$previous>2, 3,data$previous)
+data$exp_previous <- exp(-data$previous)
+data$previous <- NULL
+```
+
+```{r}
+ratio_table(data$poutcome,data$y,data)
+```
+This variable stays for the outcome of the previous campaign. Of course if someone had accepted our offer some time ago he is way more likely to do it again, so this variable is very important. We should note that the nonexistent value is the same as being not contacted is in the last_campaign_contacted, so we should only encode if the outcome of the previous campaign was successful based on this one client. 
+```{r}
+data$prev_success <- ifelse(data$poutcome=="success", 1,0)
+data$poutcome <- NULL
+```
+```{r}
+df <- data
+```
+
+```{r}
+run3(data$emp.var.rate, data$y,data, "emp.var.rate")
+```
+This variable stays for the cyclical employment variation (quarterly indicator), so it measures how much peoples were hired or fired due to shifts in the conditions of the economy. When the economy is in its peak this rate is lower, so it is easier to get a job and therefore there is more cash to be invested . Lets also observe that this relation is piecewise linear (keep in mind that this data is taken from only 3 consecutive year), but sadly we cannot make any reasonable values merges to improve its linearity, and removing some of the data (the ones that may be considered outliners) also makes no sense, because they fit the trends nicely. 
+```{r}
+run3(data$cons.price.idx, data$y,data, "cons.price.idx")
+```
+This variable is simply the measure of inflation (higher consumer price index means higher inflation). When the inflation is high people will tend to spend more money, and when its low they will tend to store them (e.g. on term deposits). In this case the relation looks like two linear ones: one for blue and red dots and one for the gray ones, yet again we can see that combining data from three years (after the economic crisis) does change a lot. For this reasons I will not make any merges (or removes) in this case, because we would loss some information about the trends in one or two years.
+
+```{r}
+run3(data$cons.conf.idx, data$y,data, "cons.conf.idx")
+table(data[-data$cons.conf.idx >35,]$y)
+table(data$y)
+```
+Consumer confidence index measures the optimism of the consumers, so higher index should result in more term deposits (because there is no need to spend the money right now). Again, we can clearly see two distinct linear relations and we cannot remove the outliners because it would imbalance our data even further (we would lose the values with the lowest fail/success ratio)...
+```{r}
+run3(data$euribor3m, data$y,data, "euribor3m")
+```
+The 3 month Euribor interest rate is the interest rate at which banks lend money to one another with 3 month to pay it off. Lower interest rates means that the term deposits should have low interest rate, so less people would like to take them. Also observe that this plot is a huge mess, because this is daily indicator.
+```{r}
+run3(data$nr.employed, data$y,data, "nr.employed")
+```
+This variable stays for the number of employees in the bank. I think thats it's very weird that we can see such a strong increasing relation, because higher number of employees should be able to process the data better. BUT there may be one reason and it's again related to the 3 years of gathering data: during the first two years the camping was on a small scale so it was way easier to preprocess the data and the outcome was (on average) much better, in the last year the bank employed much more workers for the camping but also made way more calls, so the data of the clients was not as well analyzed as before.
+```{r}
+run3(data$age, data$y,data, "age")
+```
+This variable is simply the age of the client. As we should have expected there are some intervals: for age <42 peoples tend to have mortgage, have to feed etc. their kids so the expenses are getting higher and higher (older kid means more cash to spend). Around 42 the kids should be close to live on their own, so they require less and less cash and also the mortgage is almost paid off. Age >60 is the retirement age, when people have already accumulated a lot of cash and may put it on the bank account. As we can see, for age smaller than around 64 we got a parabola, while for age above 63 the function looks somewhat linear. We can also spot that for the age above around 70 (the boxplot also stays that we can remove them without a doubt) there are plenty of the outliners, so we can see what happens if we remove them:
+```{r}
+table(data$y)
+nrow(data)
+table(data[data$age <70,]$y)
+nrow(data)-nrow(data[data$age <70,])
+table(data[data$age <70,]$job)
+table(data$job)
+```
+Clearly we will lose about 5% of the positive outcomes and about 20% of the pensioners, but I think we should do this. We can also make a varieble of transformed age, where we merge all the ages above 65 and transorm it to get nicely linear graph:
+```{r}
+data <- data[data$age <70,]
+data$age_transformed <- ifelse(data$age>65, 66, data$age)
+data$age_transformed <- (data$age_transformed-42)^2
+run3(data$age_transformed, data$y,data, "age_transformed")
+```
+I think we are done with the "features explanation" part, just to end the part 2) of the project (I think we also did some of the 3) part):
+```{r}
+df <- data
+```
+At the end we have to one hot encode caterogical variables, standardization will be required for the PCA, calculating correlations, logistic regression etc but those algorithms are doing it anyway, so there is no point in standardizing our data (I will not do this for the clarity).
+```{r}
+#before one hot encoding we need to get the character variables as factor
+data <- df
+data[sapply(data, is.character)] <- lapply(data[sapply(data, is.character)], as.factor)
+data <- one_hot(as.data.table(data))
+#After all those merges we can have more duplicates, so we just remove them (and look how much changes after this)
+table(data$y)
+table(unique( data )$y)
+data <- unique(data)
+#I will standardize the data just to show that I know how to do it
+data_standardized<- as.data.frame(scale(data))
+data_standardized$y <- data$y
+summary(data_standardized)
+```
+
+3) We now have a pretty big amount of variables, so first we can use PCA and show only some of the arrows:
+```{r}
+#this functions plots the graph for choice_one, choice_two principal components, it shows only the arrows for rows from first_row to last_row
+plot_pca = function (data_pca, first_row, last_row, choice_one, choice_two){
+  
+  data_pca$y <-NULL
+  data_pca <-  prcomp(data_pca, center = TRUE,scale. = TRUE) 
+
+  g <- ggbiplot(data_pca, ellipse=TRUE, groups=data$y, obs.scale = 1, var.scale = 1, alpha=0, choices = choice_one:choice_two)
+
+  g <- ggplot_build(g)
+
+  g$data[[1]] <- g$data[[1]][(first_row:last_row), ]
+  g$data[[4]] <- g$data[[4]][(first_row:last_row), ]
+
+  plot(ggplot_gtable(g))
+}
+#this one makes a ordered table of highest correlations between variables above some threshold
+ordered_high_cor = function(data, threshold ) {
+
+  tab<-cor(data)
+  tab <- as.data.frame(as.table(tab))
+  tab <- subset(tab, abs(Freq) >threshold  & ! tab$Var1==tab$Var2)
+  tab <- tab[order(abs(tab$Freq), decreasing = TRUE),]
+  tab[seq(1, nrow(tab), 2),]
+}
+#this one lists the lowest correlations with our target variable
+ordered_low_y_cor= function(data, threshold ) {
+
+  tab<- cor(data, data$y)
+  tab <- as.data.frame(as.table(tab))
+  tab <- subset(tab, abs(Freq) < threshold)
+  tab <- tab[order(abs(tab$Freq), decreasing = FALSE),]
+  tab$Var2 <- NULL
+  tab
+}  
+```
+Looking at the job variables first:
+```{r}
+#here only job_admin. job_blue.collar job_entrepreneur job_menagement and job_housemaid are considered
+plot_pca (data, 2, 6, 1,2)
+plot_pca (data, 2, 6, 2,3)
+plot_pca (data, 2, 6, 3,4)
+#here is the rest of the jobs
+plot_pca (data, 7, 12, 1,2)
+plot_pca (data, 7, 12, 2,3)
+plot_pca (data, 7, 12, 3,4)
+ordered_low_y_cor(data, 0.1)
+```
+First lets observe that in in our case PC1 is extremely important, the other ones explain around 2 or less percent of the variance in y.
+As we can see the job_menagement, job_self.employed and job_housemaid does not contribute to any of the PC from 1 to 4 and it has the lowest correlation, so we will remove them. Also as we can see the job_technician has very low correlation, but it is rather important for the first principal component so we will not remove it:
+```{r}
+data$job_management <- NULL
+data[,7] <- NULL
+data$job_housemaid <- NULL
+```
+
+Now lets consider how the job and education variables correlates on the PCA graphs:
+```{r}
+plot_pca (data, 2, 18, 1,2)
+#now running those just to see where the names are
+plot_pca (data, 2, 11, 1,2)
+plot_pca (data, 12, 18, 1,2)
+#some other, cleaner pca graphs
+plot_pca (data, 2, 18, 2,3)
+plot_pca (data, 12, 18, 3,4)
+ordered_low_y_cor(data, 0.1)
+```
+As we can see the PC1 is getting more and more important... 
+We can also now merge the university education with the admin profession and all of the basic educations with the blue collar job. I will also remove education_professional.course because it has very low correlation with y and contributes to the PC from 1 to 3 only a little bit:
+```{r}
+data$education_professional.course <- NULL
+data$univ_or_admin <- ifelse(data$job_admin.==1 | data$education_university.degree ==1, 1,0)
+data$job_admin. <- NULL
+data$education_university.degree <- NULL
+data$basic_or_bluecoll <- ifelse(data$education_basic.4y ==1 | data$education_basic.6y ==1 |data$education_basic.9y ==1 | data[,2]==1, 1,0)
+data$education_basic.4y <- NULL
+data$education_basic.6y <- NULL
+data$education_basic.9y <- NULL
+data[,2] <- NULL 
+```
+Going for the day and month variables:
+```{r}
+#splitted into two parts so its cleaner:
+plot_pca (data, 14, 19, 1,2)
+plot_pca (data, 14, 19, 2,3)
+plot_pca (data, 14, 19, 3,4)
+plot_pca (data, 20, 24, 1,2)
+plot_pca (data, 20, 24, 2,3)
+plot_pca (data, 20, 24, 3,4)
+plot_pca (data, 20, 24, 4,5)
+ordered_low_y_cor(data, 0.1)
+```
+I think we should leave all of the month variables and remove the day_of_week_fri and day_of_week_tue_wed variables (both have very low correlations and are not too important in terms of PCA analysis). 
+```{r}
+data$day_of_week_tue_wed <- NULL
+data$day_of_week_fri <- NULL
+```
+Going for the housing and loan variables:
+```{r}
+plot_pca (data, 12, 13, 1,2)
+plot_pca (data, 12, 13, 2,3)
+plot_pca (data, 12, 13, 3,4)
+plot_pca (data, 12, 13, 4,5)
+ordered_low_y_cor(data,0.1)
+```
+We can surely remove them:
+```{r}
+data$housing <- NULL
+data$loan <- NULL
+```
+We can look at the rest of the dummy variables:
+```{r}
+plot_pca (data, 27, 31, 1,2)
+plot_pca (data, 27, 31, 2,3)
+plot_pca (data, 27, 31, 3,4)
+plot_pca (data, 27, 31, 4,5)
+ordered_high_cor(data,0.1)
+cor(data$y,data$last_campaign_contacted)
+cor(data$y,data$prev_success)
+```
+prev_success and last_campaign_contacted are extreamly correlated and look the same on the pca, so we can remove the variable with lower correlation with our target variable:
+```{r}
+data$prev_success <- NULL
+```
+We have already deleted 13 variables (almost 30% of all), so we can now try some more computing demanding techniques. We will now use k-means clustering, but sadly we can do so only for the continuous variables (we can also use Gower's metric, but its not a build in option). 
+```{r}
+#first we must get only the continuous variables
+data_clustering <- data
+data_clustering <- data_clustering[,-c(2:20)]
+data_clustering <- data_clustering[,-c(8:11)]
+data_clustering <- data_clustering[,-c(10:11)]
+data_clustering <- unique(data_clustering)
+data_clustering<- as.data.frame(scale(data_clustering))
+#now in order to cluster variables we need to transpose the dataset
+data_clustering_t <- t(data_clustering)
+#We gonna restart the algorithm 25 times (so the outcome will be better) and make 4 clusters, I won't optimize the number of clusters right here
+set.seed(100)
+km <- kmeans(data_clustering_t, centers=4, nstart = 25)
+fviz_cluster(km, data_clustering_t)
+```
+The above stays that nr.employed, emp.var.rate and eurobor3m have a very similar behavior, we can also see it on heatmap of correlations:
+```{r}
+corrplot(cor(data_clustering), method = "pie", tl.cex=0.5)
+```
+Clearly we should remove two of those 3, I think we should remove the euribo3m and emp.var.rate because they are not linear, and also euribo3m contains a lot of nois. As we can see by doing so we will not lose too much rows after choosing the unique ones:
+```{r}
+nrow(unique(data))
+table(unique(data)$y)
+data$euribor3m <- NULL
+data$emp.var.rate <- NULL
+nrow(unique(data))
+table(unique(data)$y)
+```
+We can also use hierarchical clustering:
+```{r}
+#of course we dont want to have our target variable in the dendrogram
+hc <- hclust(dist(t(data[,-25])))
+plot(hc)
+```
+The above tree stays that all the variables except for the nr.employed may be considered as one huge cluster, so I will not merge anything useing this graph.
+
+```{r}
+corrplot(cor(data), method = "pie", tl.cex=0.5)
+ordered_low_y_cor(data,0.1)
+ordered_high_cor(data,0.1)
+```
+Looking at the heatmap once again I think that we should drop both marital_divorced and cons.price.idx, the latter is one of the most correlated ones. For the marital_divorced we will not lose any information, because we still got the marital_married and marital_single variables.
+```{r}
+data$marital_divorced  <- NULL
+data$cons.price.idx <- NULL
+```
+We should also observe that we have to remove at least one of the months variable of otherwise we will get into something called the "dummy trap", because if for example all of the month variables but the month_jul are 0 we know that the month has to be july, so there is a perfect linear correlation between those variables. As we had seen before, non of the merges seemed reasonable so we will just remove the one with lowest correlation with our target variable:
+```{r}
+ordered_low_y_cor(data,0.1)
+```
+```{r}
+data$month_jun <- NULL
+table(data$y)
+data <- unique(data)
+table(data$y)
+data
+```
+I think that at this point our data may be considered a lot cleaner. We had reduced the number of variables from 46 to 28 (I include all of the one hot encoded) and menage to balance the data by doing so (reducing the repeating rows). I know that by doing so we probably will got a worse score on correlation robust algorithms such as the random forest, but by doing so we have shortened the computation time and we can use some better algorithms optimization techniques. Also note that we had menage to balance our dataset a little bit.
+
+4) and 5) First of all we need some functions to split the dataset and oversample training set (we are dealing with imbalanced data):
+```{r}
+#I know that there are some fancy ways of the oversampling, but unfortunately the SMOTE function seems to be bugged (or I dont know how to use it)
+oversample = function (data, seed ){
+  if(missing(seed)) {
+      seed=100
+  }
+  set.seed(seed)
+  rows_sampled = sample (1:nrow(data[data$y==1,]), nrow(data[data$y==0,]), replace = TRUE)
+  data_1 <- data[data$y==1,]
+  data_1 <- data_1[rows_sampled,]
+  return(merge(data[data$y==0,], data_1, all=TRUE))
+}
+
+#splitting the dataset for training test and validation 
+data_split = function(data_to_split, ratio_train, ratio_test, ratio_validate, seed){
+  if(missing(seed)) {
+      seed=100
+  }
+  
+  spec = c(train = ratio_train, test = ratio_test, validate = ratio_validate)
+  set.seed(seed)
+  g = sample(cut(seq(nrow(data_to_split)), nrow(data_to_split)*cumsum(c(0,spec)),labels = names(spec)))
+  
+  data_g = split(data_to_split, g)
+
+  set.seed(seed)
+  #we need to balance the training set, balancing test or validation will result in meaningless results (because thenwe would model the oversampled
+  #datatset)
+  data_g[[1]] <- oversample(data_g[[1]], seed)
+  return(data_g)
+}
+```
+For the measurement metric we will use the F-score. The reason is that our data is unbalanced, so measure like the accuracy is pointless, so we need some measure to check how well the positives were predicted and at the same time be careful not to call the ones that will not subscribe for the term deposit. We can also use the AUC score, but computing it is way more time demanding and will not be too hopeful if we want to for example optimize the logistic regression cut of threshold.
+For the first model we will simply use logistic regression because its very quick, we got way more data than variables so it should not overfit and its not a blackbox, so we can easily check the outcome if we want to. I will not use the step function (variables reduction technique) because it would lower our F score. The bad thing about the linear regression is that there are no hyperparameters to tune...
+
+```{r}
+model_regression = function (data_splitted, seed) {
+  if(missing(seed)) {
+      seed=100
+  }
+  training <- data_splitted[[1]]
+  test <- data_splitted[[2]]
+  validation <- data_splitted[[3]]
+  set.seed(seed)
+  model = glm(y ~ ., data = training, family = binomial)
+  
+  #for getting the optimal cut of threshold we will be looking at the highest F score on the test set
+  CUT_OFFS = seq(0, 1, by = 0.01) 
+  Fscore = function(x, outcome, test){
+    outcome_y <- ifelse(outcome > x, 1, 0)
+    tab <- table(outcome_y, test$y)
+    #Im using the ifelse because if the level of cut is too big/too low all the outcome will be classified as 1 or 0 (and it means that the cut is terrible)
+    ifelse (nrow(tab)==2, tab[2,2]/(tab[2,2]+(tab[1,2]+tab[2,1])/2),0 ) 
+  }
+  set.seed(seed)
+  outcome <- predict(model, newdata = test, type = "response")
+  Fscores <- sapply(CUT_OFFS, function(x) Fscore (x, outcome, test))
+  optimal_cut <- (which.max(Fscores)[1]-1)*0.01
+  
+  outcome_test <- predict(model, newdata=test, type="response")
+  outcome_validation <- predict(model, newdata = validation, type = "response")
+
+  outcome_y_validation <- ifelse(outcome_validation > optimal_cut, 1, 0)
+  outcome_y_test <- ifelse(outcome_test > optimal_cut, 1, 0)
+  
+  conf_matrix <- table(outcome_y_validation, validation$y)
+
+  Fscore <- function(x){x[2,2]/(x[2,2]+(x[1,2]+x[2,1])/2)}
+  print(conf_matrix)
+  print(Fscore(conf_matrix))
+  
+  #now using the code from the labs we produce some curves
+  score.or.class = gain = lift = roc = auc = prediction.object = list()
+  score.or.class[[1]] = list(validation$y, validation$y)
+  score.or.class[[2]] = list(outcome_test,test$y)
+  score.or.class[[3]] = list(outcome_validation, validation$y)
+  class.average = mean(validation$y)
+  
+  random.class = 1
+  for (i in 1:(nrow(validation) - 1)) {
+    random.class = c(random.class, mean(random.class) < class.average)
+  }
+  score.or.class[[4]] = list(seq(0, 1, len = nrow(validation)), random.class)
+  for (i in 1:length(score.or.class)) {
+    prediction.object[[i]] = prediction(score.or.class[[i]][[1]],
+                                       score.or.class[[i]][[2]])
+    gain[[i]] = performance(prediction.object[[i]], "tpr", "rpp")
+    lift[[i]] = performance(prediction.object[[i]], "lift", "rpp")
+    roc[[i]] = performance(prediction.object[[i]], "tpr", "fpr")
+    auc[[i]] = performance(prediction.object[[i]], "auc")
+  }
+  LEGEND_LABELS = c("wizard", "test", "validation", "random")
+  #Creating plots
+  ShowCurve = function(list, name, AUC = FALSE, legend.position = "right") {
+    for (i in 1:length(list)) {
+      plot(list[[i]], main = paste(name, " curve"),
+           col = gray((i - 1) / 4), lwd = 2, add = (i != 1), xlim = c(0, 1))
+      if (AUC) {
+        text(.2, 0.9 - i * 0.1, pos = 4, col = gray((i - 1) / 4), cex = .9,
+             paste("AUC =", round(auc[[i]]@y.values[[1]], digit = 2)))
+      }
+    }
+    legend(legend.position, lty = 2, lwd = 2, col = gray(0:3 / 4),
+           y.intersp = .6, legend = LEGEND_LABELS, seg.len = 0.6, bty = "n")
+  }
+  par(mfrow = c(2, 2), mar = c(4, 4, 2, 1))
+  ShowCurve(gain, "Gain")
+  ShowCurve(lift, "Lift", legend.position = "topright")
+  ShowCurve(roc, "ROC", AUC = TRUE)
+  return(model)
+  
+}
+#Im using the simple 60:20:20 splits
+start.time <- Sys.time()
+model_regression_outcome <- model_regression (data_split(data,0.6,0.2,0.2))
+end.time <- Sys.time()
+end.time - start.time
+```
+We can see a few things: looking at the curves we may observe that there seems to be no be almost no problem with the overfitting (so using lasso or elastic net is pointless), the model runs extremely fast and that most of the positive outcomes were (luckily) predicted as positive.
+```{r}
+summary(model_regression_outcome)
+```
+By the above it turns out that almost all of variables used are statistically significant, the model runs very fast so we can try expanding the variables used by the interactions with the rest of the variables ( excluding interactions between the campaign, cons.conf.idx and nr.employed):
+```{r}
+model_regression_expanded = function (data_splitted, seed) {
+  if(missing(seed)) {
+      seed=100
+  }
+  training <- data_splitted[[1]]
+  test <- data_splitted[[2]]
+  validation <- data_splitted[[3]]
+  set.seed(seed)
+  model = glm(y ~ + (.)*(+campaign+cons.conf.idx+nr.employed)   , data = training, family = binomial)
+  
+  #for getting the optimal cut of threshold we will be looking at the highest F score on the test set
+  CUT_OFFS = seq(0, 1, by = 0.01) 
+  Fscore = function(x, outcome, test){
+    outcome_y <- ifelse(outcome > x, 1, 0)
+    tab <- table(outcome_y,test$y)
+    #Im using the ifelse because if the level of cut is too big/too low all the outcome will be classified as 1 or 0 (and it means that the cut is terrible)
+    ifelse (nrow(tab)==2, tab[2,2]/(tab[2,2]+(tab[1,2]+tab[2,1])/2),0 ) 
+  }
+  set.seed(seed)
+  outcome <- predict(model, newdata = test, type = "response")
+  Fscores <- sapply(CUT_OFFS, function(x) Fscore (x, outcome, test))
+  optimal_cut <- (which.max(Fscores)[1]-1)*0.01
+  
+  outcome_test <- predict(model, newdata=test, type="response")
+  outcome_validation <- predict(model, newdata = validation, type = "response")
+
+  outcome_y_validation <- ifelse(outcome_validation > optimal_cut, 1, 0)
+  outcome_y_test <- ifelse(outcome_test > optimal_cut, 1, 0)
+  
+  conf_matrix <- table(outcome_y_validation, validation$y )
+
+  Fscore <- function(x){x[2,2]/(x[2,2]+(x[1,2]+x[2,1])/2)}
+  print(conf_matrix)
+  print(Fscore(conf_matrix))
+  
+  #now using the code from the labs we produce some curves
+  score.or.class = gain = lift = roc = auc = prediction.object = list()
+  score.or.class[[1]] = list(validation$y, validation$y)
+  score.or.class[[2]] = list(outcome_test,test$y)
+  score.or.class[[3]] = list(outcome_validation, validation$y)
+  class.average = mean(validation$y)
+  
+  random.class = 1
+  for (i in 1:(nrow(validation) - 1)) {
+    random.class = c(random.class, mean(random.class) < class.average)
+  }
+  score.or.class[[4]] = list(seq(0, 1, len = nrow(validation)), random.class)
+  for (i in 1:length(score.or.class)) {
+    prediction.object[[i]] = prediction(score.or.class[[i]][[1]],
+                                       score.or.class[[i]][[2]])
+    gain[[i]] = performance(prediction.object[[i]], "tpr", "rpp")
+    lift[[i]] = performance(prediction.object[[i]], "lift", "rpp")
+    roc[[i]] = performance(prediction.object[[i]], "tpr", "fpr")
+    auc[[i]] = performance(prediction.object[[i]], "auc")
+  }
+  LEGEND_LABELS = c("wizard", "test", "validation", "random")
+  #Creating plots
+  ShowCurve = function(list, name, AUC = FALSE, legend.position = "right") {
+    for (i in 1:length(list)) {
+      plot(list[[i]], main = paste(name, " curve"),
+           col = gray((i - 1) / 4), lwd = 2, add = (i != 1), xlim = c(0, 1))
+      if (AUC) {
+        text(.2, 0.9 - i * 0.1, pos = 4, col = gray((i - 1) / 4), cex = .9,
+             paste("AUC =", round(auc[[i]]@y.values[[1]], digit = 2)))
+      }
+    }
+    legend(legend.position, lty = 2, lwd = 2, col = gray(0:3 / 4),
+           y.intersp = .6, legend = LEGEND_LABELS, seg.len = 0.6, bty = "n")
+  }
+  par(mfrow = c(2, 2), mar = c(4, 4, 2, 1))
+  ShowCurve(gain, "Gain")
+  ShowCurve(lift, "Lift", legend.position = "topright")
+  ShowCurve(roc, "ROC", AUC = TRUE)
+  print(optimal_cut)
+  return(model)
+  
+}
+#Im using the simple 60:20:20 splits
+start.time <- Sys.time()
+model_regression_expanded_outcome <- model_regression_expanded (data_split(data,0.6,0.2,0.2))
+end.time <- Sys.time()
+end.time - start.time
+```
+The warning "prediction from a rank-deficient fit may be misleading" is because of the dummy trap I had discussed before. 
+As we can see the ROC curves and the F-score are a bit better (even thought there is a dummy trap), if we add more we will surely got the multicolinearity problem so we will stop here.
+
+For the next model we will use K nearest neighbors. This model is very good if there is not too much noise in the dataset and it can capture non-linear relationship with the target variable, as far as I know its also widely used for recommendations (e.g. on Netflix). The bad thing is that this model runs very slowly and is very prone to the noise.
+
+```{r}
+model_KNN = function (data_splitted, K_lowest, K_highest, seed) {
+  if(missing(seed)) {
+      seed=100
+  }
+  training <- data_splitted[[1]]
+  test <- data_splitted[[2]]
+  validation <- data_splitted[[3]]
+
+  #for knn we need to split our datasets in 2 parts
+  target_training <- training$y
+  test_y <- test$y
+  validation_y <- validation$y
+  training$y <- NULL
+  test$y <- NULL
+  validation$y <- NULL
+
+  K_table = c(K_lowest:K_highest)
+  Fscores=c()
+  for (i in K_table){
+    outcome_y <- knn(training ,test,cl=target_training,k=i)
+    
+    tab <- table(outcome_y ,test_y)
+    Fscores[i] <-  ifelse (nrow(tab)==2, tab[2,2]/(tab[2,2]+(tab[1,2]+tab[2,1])/2),0 )
+  }
+  optimal_K <- which.max(Fscores)[1]
+  
+  outcome_y <- knn(training ,validation, cl=target_training, k=optimal_K)
+  
+  conf_matrix <- table(outcome_y ,validation_y)
+  Fscore <- function(x){ ifelse (ncol(tab)==2, tab[2,2]/(tab[2,2]+(tab[1,2]+tab[2,1])/2),0 )}
+  print(optimal_K)
+  #in this case the relation between the K and F score is very interesting so we will plot it 
+  Fscores <- Fscores[!is.na(Fscores)]
+  plot(K_table,Fscores)
+  print(Fscore(conf_matrix))
+  print(conf_matrix)
+  
+  outcome_test <- knn(training, test, cl=target_training, k=optimal_K, prob=TRUE)
+  outcome_validation <- knn(training, validation, cl=target_training, k=optimal_K, prob=TRUE)
+  
+  #for the curves we need to have the probability outcomes, otherwise the graphs would be just one point
+  outcome_test <- attr(outcome_test, "prob")
+  outcome_validation <- attr(outcome_validation, "prob")
+  
+  score.or.class = gain = lift = roc = auc = prediction.object = list()
+  score.or.class[[1]] = list(validation_y, validation_y)
+  score.or.class[[2]] = list(outcome_test,test_y)
+  score.or.class[[3]] = list(outcome_validation, validation_y)
+  class.average = mean(validation_y)
+  
+  random.class = 1
+  for (i in 1:(nrow(validation) - 1)) {
+    random.class = c(random.class, mean(random.class) < class.average)
+  }
+  score.or.class[[4]] = list(seq(0, 1, len = nrow(validation)), random.class)
+  for (i in 1:length(score.or.class)) {
+    prediction.object[[i]] = prediction(score.or.class[[i]][[1]],
+                                       score.or.class[[i]][[2]])
+    gain[[i]] = performance(prediction.object[[i]], "tpr", "rpp")
+    lift[[i]] = performance(prediction.object[[i]], "lift", "rpp")
+    roc[[i]] = performance(prediction.object[[i]], "tpr", "fpr")
+    auc[[i]] = performance(prediction.object[[i]], "auc")
+  }
+  LEGEND_LABELS = c("wizard", "test", "validation", "random")
+  #Creating plots
+  ShowCurve = function(list, name, AUC = FALSE, legend.position = "right") {
+    for (i in 1:length(list)) {
+      plot(list[[i]], main = paste(name, " curve"),
+           col = gray((i - 1) / 4), lwd = 2, add = (i != 1), xlim = c(0, 1))
+      if (AUC) {
+        text(.2, 0.9 - i * 0.1, pos = 4, col = gray((i - 1) / 4), cex = .9,
+             paste("AUC =", round(auc[[i]]@y.values[[1]], digit = 2)))
+      }
+    }
+    legend(legend.position, lty = 2, lwd = 2, col = gray(0:3 / 4),
+           y.intersp = .6, legend = LEGEND_LABELS, seg.len = 0.6, bty = "n")
+  }
+  par(mfrow = c(2, 2), mar = c(4, 4, 2, 1))
+  ShowCurve(gain, "Gain")
+  ShowCurve(lift, "Lift", legend.position = "topright")
+  ShowCurve(roc, "ROC", AUC = TRUE)
+  #return(conf_matrix)
+}
+```
+
+```{r}
+#we need to standardize the data first, because as far as I know the build in algorythm wont do this
+data_standardized<- as.data.frame(scale(data))
+data_standardized$y <- data$y
+#we will begin with running it for K from 1 to 100 but be careful, it DOES take a while
+start.time <- Sys.time()
+model_KNN(data_split(data_standardized,0.6,0.2,0.2),1,100)
+end.time <- Sys.time()
+end.time - start.time
+```
+I dont want to show all of the K checked, because it would take more than 3 hours. What we can observe is that F score consistently rises with K, so we can try running it to the biggest K possible:
+
+```{r}
+start.time <- Sys.time()
+model_KNN(data_split(data_standardized,0.6,0.2,0.2),450,499)
+end.time <- Sys.time()
+end.time - start.time
+```
+As we can observe the F score is still kind of rising with K (the relation is like x+sin(x)), but at this range of K it is still worse than the regression: the F score is is still way lower than before, we can also observe that the ROC curves seems to always be lower than the curve from logistic regression model (this is a clear sign that this model is worse). We should note that the biggest advantage of this model is that the misspredictions of class 1 as 0 are  much better than the linear model. 
+
+Such a low AUC score with pretty good F score may imply that most of the the votes for each point were almost ties, so we surely have some huge noise issues. Same goes for such a big K, because we need to consider a huge number of neighbors to overcome the noise. Another thing to consider is the fact that the with lower K there is lower number of misspredicted 1 as the 0, so it can imply that the ones are somewhat close to each other, but the noise makes the prediction difficult.  
+
+The another drawback of this model is that there are not too much hyperparameters to tune: we can surely tune the number of neighbors considered (K), but it is very slow and as far as I know there are no more parameters to consider, one may be the weightened KNN but it would take way too long. 
+
+For the next model we will use an ensemble method, mainly the random forest. This model have plenty of advanteges: it is robust to outliners (I think not to useful in our case), it can capture non-linear relationships (meanwhile the logistic regression cannot, and as we have seen there are propably plenty of them) and it tends not to overfit (it would be surely an issue for the standard decision tree). 
+The drawbacks is that the algorithm trains very slowly, needs a lot of data (not sure if our dataset is big enough) and is not suitable for linear models with a lot of sparse features (it may be our case because we have plenty of dummy variables for month, job and education).
+```{r}
+model_random_forest = function (data_splitted, n_test, n_model, seed) {
+  if(missing(seed)) {
+      seed=100
+  }
+  training <- data_splitted[[1]]
+  test <- data_splitted[[2]]
+  validation <- data_splitted[[3]]
+  
+  #the optimal mtry will be 2 so you can change this line if want to run it faster
+  mtry = c(1:(ncol(training)-1))
+  Fscores=c()
+  for (i in mtry){
+    set.seed(seed)
+  model_forest <- randomForest(as.factor(y)~.,data=training, ntree=n_test, mtry=mtry[i] )
+    set.seed(seed)
+    
+    outcome_y <- predict(model_forest, newdata=test, type="response")
+    tab <- table(outcome_y ,test$y)
+    Fscores[i] <-  ifelse (nrow(tab)==2, tab[2,2]/(tab[2,2]+(tab[1,2]+tab[2,1])/2),0 )
+  }
+  
+  optimal_mtry <- which.max(Fscores)[1]
+  model_forest <- randomForest(as.factor(y)~.,data=training, ntree=n_model, mtry=optimal_mtry )
+  
+  outcome_y <- predict(model_forest, newdata=validation, type="response")
+  
+  conf_matrix <- table(outcome_y ,validation$y)
+  Fscore <- function(x){ ifelse (nrow(tab)==2, tab[2,2]/(tab[2,2]+(tab[1,2]+tab[2,1])/2),0 )}
+  print(optimal_mtry)
+  #we will also plot the relation between mtry hyperparameter and the Fscores
+  Fscores <- Fscores[!is.na(Fscores)]
+  plot(mtry,Fscores)
+  print(Fscore(conf_matrix))
+  print(conf_matrix)
+  
+  outcome_test = predict(model_forest, newdata=test, type="prob")[,2]
+  
+  outcome_validation = predict(model_forest, newdata=validation, type="prob")[,2]
+  
+  score.or.class = gain = lift = roc = auc = prediction.object = list()
+  score.or.class[[1]] = list(validation$y, validation$y)
+  score.or.class[[2]] = list(outcome_test,test$y)
+  score.or.class[[3]] = list(outcome_validation, validation$y)
+  class.average = mean(validation$y)
+  
+  random.class = 1
+  for (i in 1:(nrow(validation) - 1)) {
+    random.class = c(random.class, mean(random.class) < class.average)
+  }
+  score.or.class[[4]] = list(seq(0, 1, len = nrow(validation)), random.class)
+  for (i in 1:length(score.or.class)) {
+    prediction.object[[i]] = prediction(score.or.class[[i]][[1]],
+                                       score.or.class[[i]][[2]])
+    gain[[i]] = performance(prediction.object[[i]], "tpr", "rpp")
+    lift[[i]] = performance(prediction.object[[i]], "lift", "rpp")
+    roc[[i]] = performance(prediction.object[[i]], "tpr", "fpr")
+    auc[[i]] = performance(prediction.object[[i]], "auc")
+  }
+  LEGEND_LABELS = c("wizard", "test", "validation", "random")
+  #Creating plots
+  ShowCurve = function(list, name, AUC = FALSE, legend.position = "right") {
+    for (i in 1:length(list)) {
+      plot(list[[i]], main = paste(name, " curve"),
+           col = gray((i - 1) / 4), lwd = 2, add = (i != 1), xlim = c(0, 1))
+      if (AUC) {
+        text(.2, 0.9 - i * 0.1, pos = 4, col = gray((i - 1) / 4), cex = .9,
+             paste("AUC =", round(auc[[i]]@y.values[[1]], digit = 2)))
+      }
+    }
+    legend(legend.position, lty = 2, lwd = 2, col = gray(0:3 / 4),
+           y.intersp = .6, legend = LEGEND_LABELS, seg.len = 0.6, bty = "n")
+  }
+  par(mfrow = c(2, 2), mar = c(4, 4, 2, 1))
+  ShowCurve(gain, "Gain")
+  ShowCurve(lift, "Lift", legend.position = "topright")
+  ShowCurve(roc, "ROC", AUC = TRUE)
+  return(model_forest)
+}
+```
+
+```{r}
+start.time <- Sys.time()
+#of course the higher the number of trees the better outcome will be, but we will just use 50 trees for looking for the optimal mtry parameter and 2000 to #build a model with the optimal mtry number
+model_random_forest_outcome <- model_random_forest(data_split(data,0.6,0.2,0.2),50,2000)
+end.time <- Sys.time()
+end.time - start.time
+```
+As we can see the optimal mtry is 2, which means that we are using trees with high bias (it uses a lot of variables for the first split). We should also note that the F score is very low compare to the previous ones and that the AUC is almost the highest one. We can also look at the mean Decrease in Gini index for the variables:
+```{r}
+model_random_forest_outcome$importance
+```
+Fist of all we should note, that those indexes are (almost) always lower for the dummys. The reason is simple: dummy variable can be splitted only one time. As we can see the nr.employed is the most important one (by a lot) so we should have expected that the mtry parameter will be very low. This table also tells us that we could have reduced way more variables without losing too much of the predictive power. The drawback of this model is that there is only one hyperparameter to optimaze (sure we can also reduce the maximal depth of the trees, but in our case overfitting is not a problem).
+
+Now we can run the optimal algorithms on the same dataset, get the outcomes and try to compare them. We will still be using the same dataset, you can change the seeds if you want to:
+```{r}
+data_valuation <- data_split(data,0.6,0.2,0.2)
+training<- data_valuation[[1]]
+test <- data_valuation[[2]]
+validation <- data_valuation[[3]]
+#going for the logistic 
+set.seed(100)
+model_reg = glm(y ~ + (.)*(+campaign+cons.conf.idx+nr.employed)   , data = training, family = binomial)
+outcome_reg <- predict(model_reg, newdata = validation, type = "response")
+#we know the optimal cut
+outcome_y_reg <- ifelse(outcome_reg > 0.65, 1, 0)
+conf_matrix_reg <- table(outcome_y_reg, validation$y )
+
+#for the knn
+set.seed(100)
+data_valuation_knn <- data_split(data_standardized,0.6,0.2,0.2)
+training_knn<- data_valuation_knn[[1]]
+test_knn <- data_valuation_knn[[2]]
+validation_knn <- data_valuation_knn[[3]]
+target_training <- training_knn$y
+validation_y <- validation_knn$y
+training_knn$y <- NULL
+test_knn$y <- NULL
+validation_knn$y <- NULL
+
+outcome_y_knn <- knn(training_knn ,validation_knn, cl=target_training, k=481)
+outcome_knn <- knn(training_knn ,validation_knn, cl=target_training, k=481, prob=TRUE)
+outcome_knn <- attr(outcome_knn, "prob")
+conf_matrix_knn <- table(outcome_y_knn ,validation_y)
+
+#random forest model
+outcome_y_forest <- predict(model_random_forest_outcome, newdata=validation, type="response")
+outcome_forest = predict(model_random_forest_outcome, newdata=validation, type="prob")[,2]
+conf_matrix_forest <- table(outcome_y_forest ,validation_y)
+```
+We can now make a table with statistics:
+```{r}
+fourfoldplot( conf_matrix_reg)
+fourfoldplot( conf_matrix_knn)
+fourfoldplot( conf_matrix_forest)
+confusionMatrix(conf_matrix_reg)
+confusionMatrix(conf_matrix_knn)
+confusionMatrix(conf_matrix_forest)
+```
+For the regression F-score was around 0.5, for knn 0.48, and 0.34 for the random forest. As we can see all the accuracies are high, but the one from the regression is the highest (same goes for the F score). We should also note that the logistic regression model was the worst in terms of predicting the 1 class (but not by a lot), in this case the KNN was the best one. The best thing about regression model is that in predicts pretty well both classes, while the KNN has a big issue with predicting 0.
+We can also look at the ROC curves:
+
+```{r}
+#LEGEND_LABELS = c("regression", "random forest", "knn")
+pred_reg <- prediction(outcome_reg, validation$y)
+perf_reg <- performance(pred_reg,"tpr","fpr")
+
+pred_forest <- prediction(outcome_forest, validation$y)
+perf_forest <- performance(pred_forest,"tpr","fpr")
+
+pred_knn <- prediction(outcome_knn, validation_y)
+perf_knn <- performance(pred_knn,"tpr","fpr")
+
+plot( perf_reg, col="red", main="ROC curves on validation" )
+par(new=TRUE)
+plot( perf_knn, col="blue")
+par(new=TRUE)
+plot(perf_forest, col="green")
+legend(x = "bottomright", legend = c("regression AUC 0.79", "random forest AUC 0.77", "knn AUC 0.59"), col = c(2, 3, 4),lwd = 2)  
+```
+As we can see the ROC curve on the knn seems to always below curves from the regression and random forest, it also got very low AUC. The curve from the logistic regression seems to almost always be a bit above random forest curve, so I would say that by this graph and AUC the regression is the best model.
+
+Overall, I think that the expanded regression is the best one: it has the highest F score, highest AUC and predict both classes very well. It also computes extremely fast and we can easily see the parameters used (so it's not a blackbox). For the second best I would pick the knn model, because its very good at predicting the minority class, it also has pretty good F score. The biggest drawback of the random forest is that its medicore in predicting both classes, and the computation takes quite a while.
+
+
+6) To sum it up I believe that the logistic regression model with bigger number of parameters was by the best one by most of the measures, ROC curve and the computation time. This model still can be improved by removing some colinearities and checking its assumptions. The knn model was great at predicting the minority class, but it had a huge problem with the noise in data so I think that more data preprocesing is needed. For the random forest it performance may be lowered by the fact that we have removed a lot of variables, but I think that the model is not that bad. For both knn and random forest it would be useful to find and tune more hyperparameters, but as far as I know for both there are no more reasonable hyperparameters to tune (and the computation time needed may be huge). 
+
+I think that the data preprocessing part was too general and not made for any specific model, which may have resulted in worsening the models. For the regression we should have removed the collinearities, for the regression model, but it would likely make the results on the decision tree worse. For the knn we should look for the noise, but as far as I know its hard. For the random forest there is no need for excessive data preprocessing, doing so may make the outcomes worse but will also make the computation time lower (less trees are needed for the unbiased result). The good part is that overfitting was never a problem, so we had propably removed a huge part of the noise in data. We could also include the dummies for year, but its not included in the data directly (there is no such variable, even thought the observations are ordered by the consecutive months so probably also by the consecutive years).
+
+I think that the biggest issue was deciding whether or not we should remove or merge variable. My solution for the merges was looking at the PCA graphs for few of the first components or using the k-means clustering and for the removes looking both at the PCA and correlations with the target variable. 
+
+Overall, I think that the resoults are good but there is still a lot of room for improvements.
